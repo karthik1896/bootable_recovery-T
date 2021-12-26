@@ -832,16 +832,17 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     ui->SetStage(st_cur, st_max);
   }
 
-  // Extract the YYYYMMDD date from the full version string. Assume
-  // the first instance of "-[0-9]{8}-" (if any) has the desired date.
-  std::string ver = android::base::GetProperty("ro.lineage.version", "");
+  // Extract the YYYYMMDD / YYYYMMDD_HHMMSS timestamp from the full version string.
+  // Assume the first instance of "-[0-9]{8}-", or "-[0-9]{8}_[0-9]{6}-" in case
+  // VOLTAGE_VERSION_APPEND_TIME_OF_DAY is set to true has the desired date.
+  std::string ver = android::base::GetProperty("ro.voltage.version", "");
   std::smatch ver_date_match;
   std::regex_search(ver, ver_date_match, std::regex("-(\\d{8})-"));
   std::string ver_date = ver_date_match.str(1);  // Empty if no match.
 
   std::vector<std::string> title_lines = {
-    "Version " + android::base::GetProperty("ro.lineage.build.version", "(unknown)") +
-        " (" + ver_date + ")",
+    "Version: " + android::base::GetProperty("ro.voltage.version", "(unknown)") +
+        "-" + ver_date,
   };
 
   if (android::base::GetBoolProperty("ro.build.ab_update", false)) {
