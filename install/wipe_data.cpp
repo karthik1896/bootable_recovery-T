@@ -16,8 +16,11 @@
 
 #include "install/wipe_data.h"
 
+#include <fcntl.h>
+#include <linux/fs.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 
 #include <functional>
@@ -26,6 +29,8 @@
 #include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
+#include <fs_mgr/roots.h>
+#include <libdm/dm.h>
 
 #include "install/snapshot_utils.h"
 #include "otautil/dirutil.h"
@@ -37,7 +42,7 @@ constexpr const char* CACHE_ROOT = "/cache";
 constexpr const char* DATA_ROOT = "/data";
 constexpr const char* METADATA_ROOT = "/metadata";
 
-static bool EraseVolume(const char* volume, RecoveryUI* ui, bool convert_fbe) {
+static bool EraseVolume(const char* volume, RecoveryUI* ui, bool convert_fbe, std::string fs) {
   bool is_cache = (strcmp(volume, CACHE_ROOT) == 0);
   bool is_data = (strcmp(volume, DATA_ROOT) == 0);
 
@@ -48,9 +53,47 @@ static bool EraseVolume(const char* volume, RecoveryUI* ui, bool convert_fbe) {
     log_files = ReadLogFilesToMemory();
   }
 
-  ui->Print("Formatting %s...\n", volume);
+  ui->Print("Formatting %s to %s...\n", volume, fs.c_str());
 
-  ensure_path_unmounted(volume);
+  Volume* vol = volume_for_mount_point(volume);
+  if (vol->fs_mgr_flags.logical) {
+    android::dm::DeviceMapper& dm = android::dm::DeviceMapper::Instance();
+
+    map_logical_partitions();
+    // map_logical_partitions is non-blocking, so check for some limited time
+    // if it succeeded
+    for (int i = 0; i < 500; i++) {
+      if (vol->blk_device[0] == '/' ||
+          dm.GetState(vol->blk_device) == android::dm::DmDeviceState::ACTIVE)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (vol->blk_device[0] != '/' && !dm.GetDmDevicePathByName(vol->blk_device, &vol->blk_device)) {
+      PLOG(ERROR) << "Failed to find dm device path for " << vol->blk_device;
+      return false;
+    }
+
+    int fd = open(vol->blk_device.c_str(), O_RDWR);
+    if (fd < 0) {
+      PLOG(ERROR) << "Failed to open " << vol->blk_device;
+      return false;
+    }
+
+    int val = 0;
+    if (ioctl(fd, BLKROSET, &val) != 0) {
+      PLOG(ERROR) << "Failed to set " << vol->blk_device << " rw";
+      close(fd);
+      return false;
+    }
+
+    close(fd);
+  }
+
+  if (ensure_volume_unmounted(vol->blk_device) == -1) {
+    PLOG(ERROR) << "Failed to unmount volume!";
+    return false;
+  }
 
   int result;
   if (is_data && convert_fbe) {
@@ -68,9 +111,11 @@ static bool EraseVolume(const char* volume, RecoveryUI* ui, bool convert_fbe) {
       return false;
     }
     fclose(f);
-    result = format_volume(volume, CONVERT_FBE_DIR);
+    result = format_volume(volume, CONVERT_FBE_DIR, fs);
     remove(CONVERT_FBE_FILE);
     rmdir(CONVERT_FBE_DIR);
+  } else if (is_data) {
+    result = format_volume(volume, "", fs);
   } else {
     result = format_volume(volume);
   }
@@ -80,6 +125,10 @@ static bool EraseVolume(const char* volume, RecoveryUI* ui, bool convert_fbe) {
   }
 
   return (result == 0);
+}
+
+static bool EraseVolume(const char* volume, RecoveryUI* ui, bool convert_fbe) {
+  return EraseVolume(volume, ui, convert_fbe, volume_for_mount_point(volume)->fs_type);
 }
 
 bool WipeCache(RecoveryUI* ui, const std::function<bool()>& confirm_func) {
@@ -102,7 +151,7 @@ bool WipeCache(RecoveryUI* ui, const std::function<bool()>& confirm_func) {
   return success;
 }
 
-bool WipeData(Device* device, bool convert_fbe) {
+bool WipeData(Device* device, bool convert_fbe, std::string fs) {
   RecoveryUI* ui = device->GetUI();
   ui->Print("\n-- Wiping data...\n");
   ui->SetBackground(RecoveryUI::ERASING);
@@ -115,7 +164,7 @@ bool WipeData(Device* device, bool convert_fbe) {
 
   bool success = device->PreWipeData();
   if (success) {
-    success &= EraseVolume(DATA_ROOT, ui, convert_fbe);
+    success &= EraseVolume(DATA_ROOT, ui, convert_fbe, fs);
     bool has_cache = volume_for_mount_point("/cache") != nullptr;
     if (has_cache) {
       success &= EraseVolume(CACHE_ROOT, ui, false);
@@ -128,5 +177,20 @@ bool WipeData(Device* device, bool convert_fbe) {
     success &= device->PostWipeData();
   }
   ui->Print("Data wipe %s.\n", success ? "complete" : "failed");
+  return success;
+}
+
+bool WipeData(Device* device, bool convert_fbe) {
+  return WipeData(device, convert_fbe, volume_for_mount_point("/data")->fs_type);
+}
+
+bool WipeSystem(RecoveryUI* ui, const std::function<bool()>& confirm_func) {
+  if (confirm_func && !confirm_func()) {
+    return false;
+  }
+
+  ui->Print("\n-- Wiping system...\n");
+  bool success = EraseVolume(android::fs_mgr::GetSystemRoot().c_str(), ui, false);
+  ui->Print("System wipe %s.\n", success ? "complete" : "failed");
   return success;
 }

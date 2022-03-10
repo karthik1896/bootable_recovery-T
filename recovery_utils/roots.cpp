@@ -24,6 +24,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/mount.h>
 
 #include <iostream>
 #include <string>
@@ -37,12 +38,25 @@
 #include <ext4_utils/wipe.h>
 #include <fs_mgr.h>
 #include <fs_mgr/roots.h>
+#include <fs_mgr_dm_linear.h>
 
 #include "otautil/sysutil.h"
 
 using android::fs_mgr::Fstab;
 using android::fs_mgr::FstabEntry;
 using android::fs_mgr::ReadDefaultFstab;
+using android::dm::DeviceMapper;
+using android::dm::DmDeviceState;
+
+static void write_fstab_entry(const FstabEntry& entry, FILE* file) {
+  if (entry.fs_type != "emmc" && !entry.fs_mgr_flags.vold_managed && !entry.blk_device.empty() &&
+      entry.blk_device[0] == '/' && !entry.mount_point.empty() && entry.mount_point[0] == '/') {
+    fprintf(file, "%s ", entry.blk_device.c_str());
+    fprintf(file, "%s ", entry.mount_point.c_str());
+    fprintf(file, "%s ", entry.fs_type.c_str());
+    fprintf(file, "%s 0 0\n", !entry.fs_options.empty() ? entry.fs_options.c_str() : "defaults");
+  }
+}
 
 static Fstab fstab;
 
@@ -61,14 +75,36 @@ void load_volume_table() {
       .length = 0,
   });
 
+  Fstab fake_fstab;
   std::cout << "recovery filesystem table" << std::endl << "=========================" << std::endl;
   for (size_t i = 0; i < fstab.size(); ++i) {
     const auto& entry = fstab[i];
     std::cout << "  " << i << " " << entry.mount_point << " "
               << " " << entry.fs_type << " " << entry.blk_device << " " << entry.length
               << std::endl;
+
+    if (std::find_if(fake_fstab.begin(), fake_fstab.end(), [entry](const FstabEntry& e) {
+          return entry.mount_point == e.mount_point;
+        }) == fake_fstab.end()) {
+      FstabEntry* entry_detectfs =
+          android::fs_mgr::GetEntryForMountPointTryDetectFs(&fstab, entry.mount_point);
+      if (entry_detectfs == &entry) {
+        fake_fstab.emplace_back(entry);
+      }
+    }
   }
   std::cout << std::endl;
+
+  // Create a boring /etc/fstab so tools like Busybox work
+  FILE* file = fopen("/etc/fstab", "w");
+  if (file) {
+    for (auto& entry : fake_fstab) {
+      write_fstab_entry(entry, file);
+    }
+    fclose(file);
+  } else {
+    LOG(ERROR) << "Unable to create /etc/fstab";
+  }
 }
 
 Volume* volume_for_mount_point(const std::string& mount_point) {
@@ -87,6 +123,37 @@ int ensure_path_mounted(const std::string& path) {
 
 int ensure_path_unmounted(const std::string& path) {
   return android::fs_mgr::EnsurePathUnmounted(&fstab, path) ? 0 : -1;
+}
+
+int ensure_volume_unmounted(const std::string& blk_device) {
+  android::fs_mgr::Fstab mounted_fstab;
+  if (!android::fs_mgr::ReadFstabFromFile("/proc/mounts", &mounted_fstab)) {
+    LOG(ERROR) << "Failed to read /proc/mounts";
+    return -1;
+  }
+
+  /* find any entries with the volume */
+  for (auto& entry : mounted_fstab) {
+    if (entry.blk_device == blk_device) {
+      int result = umount(entry.mount_point.c_str());
+      if (result == -1) {
+        LOG(ERROR) << "Failed to unmount " << blk_device << " from " << entry.mount_point << ": "
+                   << errno;
+        return -1;
+      }
+    }
+  }
+  return 0;
+}
+
+std::vector<std::string> get_data_fs_items() {
+  std::vector<std::string> ret;
+  for (auto& entry : fstab) {
+    if (entry.mount_point == "/data") {
+      ret.emplace_back(entry.fs_type);
+    }
+  }
+  return ret;
 }
 
 static int exec_cmd(const std::vector<std::string>& args) {
@@ -130,7 +197,7 @@ static int64_t get_file_size(int fd, uint64_t reserve_len) {
   return computed_size;
 }
 
-int format_volume(const std::string& volume, const std::string& directory) {
+int format_volume(const std::string& volume, const std::string& directory, const std::string fs) {
   const FstabEntry* v = android::fs_mgr::GetEntryForPath(&fstab, volume);
   if (v == nullptr) {
     LOG(ERROR) << "unknown volume \"" << volume << "\"";
@@ -144,12 +211,12 @@ int format_volume(const std::string& volume, const std::string& directory) {
     LOG(ERROR) << "can't give path \"" << volume << "\" to format_volume";
     return -1;
   }
-  if (ensure_path_unmounted(volume) != 0) {
+  if (ensure_volume_unmounted(v->blk_device) != 0) {
     LOG(ERROR) << "format_volume: Failed to unmount \"" << v->mount_point << "\"";
     return -1;
   }
-  if (v->fs_type != "ext4" && v->fs_type != "f2fs") {
-    LOG(ERROR) << "format_volume: fs_type \"" << v->fs_type << "\" unsupported";
+  if (fs != "ext4" && fs != "f2fs") {
+    LOG(ERROR) << "format_volume: fs_type \"" << fs << "\" unsupported";
     return -1;
   }
 
@@ -190,7 +257,7 @@ int format_volume(const std::string& volume, const std::string& directory) {
     }
   }
 
-  if (v->fs_type == "ext4") {
+  if (fs == "ext4") {
     static constexpr int kBlockSize = 4096;
     std::vector<std::string> mke2fs_args = {
       "/system/bin/mke2fs", "-F", "-t", "ext4", "-b", std::to_string(kBlockSize),
@@ -287,7 +354,13 @@ int format_volume(const std::string& volume, const std::string& directory) {
 }
 
 int format_volume(const std::string& volume) {
-  return format_volume(volume, "");
+  const FstabEntry* v = android::fs_mgr::GetEntryForPath(&fstab, volume);
+  return format_volume(volume, "", v->fs_type);
+}
+
+int format_volume(const std::string& volume, const std::string& directory) {
+  const FstabEntry* v = android::fs_mgr::GetEntryForPath(&fstab, volume);
+  return format_volume(volume, directory, v->fs_type);
 }
 
 int setup_install_mounts() {
@@ -320,4 +393,37 @@ bool HasCache() {
   CHECK(!fstab.empty());
   static bool has_cache = volume_for_mount_point(CACHE_ROOT) != nullptr;
   return has_cache;
+}
+
+static bool logical_partitions_auto_mapped = false;
+
+void map_logical_partitions() {
+  if (android::base::GetBoolProperty("ro.boot.dynamic_partitions", false) &&
+      !logical_partitions_mapped()) {
+    std::string super_name = fs_mgr_get_super_partition_name();
+    if (!android::fs_mgr::CreateLogicalPartitions("/dev/block/by-name/" + super_name)) {
+      LOG(ERROR) << "Failed to map logical partitions";
+    } else {
+      logical_partitions_auto_mapped = true;
+    }
+  }
+}
+
+bool dm_find_system() {
+  auto rec = GetEntryForPath(&fstab, android::fs_mgr::GetSystemRoot());
+  if (!rec->fs_mgr_flags.logical) {
+    return false;
+  }
+  // If the fstab entry for system it's a path instead of a name, then it was already mapped
+  if (rec->blk_device[0] != '/') {
+    if (DeviceMapper::Instance().GetState(rec->blk_device) == DmDeviceState::INVALID) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool logical_partitions_mapped() {
+  return android::fs_mgr::LogicalPartitionsMapped() || logical_partitions_auto_mapped ||
+      dm_find_system();
 }
